@@ -95,7 +95,12 @@ function updateImports(source, calls, resourcePath, workingDir) {
 
     // Build new imports
     const newImports = [];
-    newImports.push('import { start } from "workflow/api"');
+    
+    // Only add start import if not already present
+    const hasStartImport = /import\s*\{[^}]*\bstart\b[^}]*\}\s*from\s*["']workflow\/api["']/.test(result);
+    if (!hasStartImport) {
+        newImports.push('import { start } from "workflow/api"');
+    }
     
     // Calculate relative path from the current file to the wrapper directory
     const wrapperDir = getCronWrapperDir(workingDir);

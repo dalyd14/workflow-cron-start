@@ -10,9 +10,16 @@
  */
 
 import { mkdir, writeFile, rm } from "node:fs/promises"
-import { join, dirname, relative } from "node:path"
+import { join, dirname, relative, resolve } from "node:path"
 import { existsSync } from "node:fs"
 import type { CronStartCall } from "./scanner.js"
+import { 
+    readTsconfigPaths, 
+    resolvePathAlias, 
+    absolutePathToAlias,
+    isPathAlias,
+    type TsconfigPaths 
+} from "./scanner.js"
 
 /** 
  * Directory name where generated wrappers are stored.
@@ -80,6 +87,9 @@ export async function generateWrapperFiles(
 ): Promise<GeneratorResult> {
     const cronDir = getCronWrapperDir(workingDir)
     
+    // Read tsconfig paths for alias resolution
+    const tsconfigPaths = await readTsconfigPaths(workingDir)
+    
     // Clean up previous generated files
     try {
         await rm(cronDir, { recursive: true, force: true })
@@ -108,7 +118,7 @@ export async function generateWrapperFiles(
     
     // Generate wrapper directory for each unique workflow
     for (const [, call] of uniqueWorkflows) {
-        const result = await generateWrapperDirectory(call, cronDir, workingDir)
+        const result = await generateWrapperDirectory(call, cronDir, workingDir, tsconfigPaths)
         generatedFiles.push(result.workflowFilePath)
         wrapperMap.set(call.workflowFunctionName, result.wrapperName)
         wrapperInfos.push(result)
@@ -127,7 +137,8 @@ export async function generateWrapperFiles(
 async function generateWrapperDirectory(
     call: CronStartCall,
     cronDir: string,
-    workingDir: string
+    workingDir: string,
+    tsconfigPaths: TsconfigPaths
 ): Promise<WrapperInfo> {
     const { workflowFunctionName, importPath, sourceFile } = call
     
@@ -147,7 +158,8 @@ async function generateWrapperDirectory(
         routeFilePath,
         importPath,
         sourceFile,
-        workingDir
+        workingDir,
+        tsconfigPaths
     )
     
     // Generate trigger route (route.ts)
@@ -169,38 +181,50 @@ async function generateWrapperDirectory(
 }
 
 /**
- * Calculate the relative import path from the generated file to the original workflow.
+ * Calculate the import path for generated files using a hybrid approach:
+ * 
+ * 1. If original import is an alias (e.g., @/lib/workflow) → preserve it as-is
+ * 2. If original import is relative → try to convert to an alias
+ * 3. If no alias covers the path → fall back to relative path calculation
+ * 
+ * This hybrid approach avoids Turbopack path validation issues in monorepos
+ * by preferring alias imports over complex relative paths.
  */
 function calculateRelativeImport(
     generatedFilePath: string,
     originalImportPath: string,
     sourceFile: string,
-    workingDir: string
+    workingDir: string,
+    tsconfigPaths: TsconfigPaths
 ): string {
+    const generatedDir = dirname(generatedFilePath)
+    
+    // CASE 1: Original import is already an alias - preserve it as-is
+    // This avoids converting @/lib/workflow to ../../../lib/workflow
+    if (isPathAlias(originalImportPath, tsconfigPaths)) {
+        return originalImportPath
+    }
+    
+    // CASE 2: Relative import - try to convert to an alias first
     if (originalImportPath.startsWith(".")) {
         const sourceDir = dirname(sourceFile)
-        const absoluteTarget = join(sourceDir, originalImportPath)
-        const generatedDir = dirname(generatedFilePath)
+        const absoluteTarget = resolve(sourceDir, originalImportPath)
+        
+        // Try to convert the absolute path to an alias
+        const aliasImport = absolutePathToAlias(absoluteTarget, workingDir, tsconfigPaths)
+        if (aliasImport) {
+            return aliasImport
+        }
+        
+        // Fall back to calculating relative path from generated file
         let relativePath = relative(generatedDir, absoluteTarget).replace(/\\/g, "/")
-        
         if (!relativePath.startsWith(".")) {
             relativePath = "./" + relativePath
         }
         return relativePath
     }
     
-    if (originalImportPath.startsWith("@/")) {
-        const pathWithoutAlias = originalImportPath.slice(2)
-        const srcPath = join(workingDir, "src", pathWithoutAlias)
-        const generatedDir = dirname(generatedFilePath)
-        let relativePath = relative(generatedDir, srcPath).replace(/\\/g, "/")
-        
-        if (!relativePath.startsWith(".")) {
-            relativePath = "./" + relativePath
-        }
-        return relativePath
-    }
-    
+    // CASE 3: Other imports (bare package names, etc.) - return as-is
     return originalImportPath
 }
 

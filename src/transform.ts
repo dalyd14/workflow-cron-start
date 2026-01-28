@@ -128,8 +128,11 @@ function updateImports(source: string, calls: CronStartCall[]): string {
     // Build the new imports we need to add
     const newImports: string[] = []
     
-    // Add start import from workflow/api
-    newImports.push('import { start } from "workflow/api"')
+    // Add start import from workflow/api (only if not already imported)
+    const hasStartImport = /import\s*\{[^}]*\bstart\b[^}]*\}\s*from\s*["']workflow\/api["']/.test(result)
+    if (!hasStartImport) {
+        newImports.push('import { start } from "workflow/api"')
+    }
     
     // Add imports for each unique wrapper
     const seenWrappers = new Set<string>()
