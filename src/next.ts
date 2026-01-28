@@ -61,9 +61,9 @@ export function withCronWorkflow(
     nextConfigOrFn:
         | NextConfig
         | ((
-              phase: string,
-              ctx: { defaultConfig: NextConfig }
-          ) => Promise<NextConfig>),
+            phase: string,
+            ctx: { defaultConfig: NextConfig }
+        ) => Promise<NextConfig>),
     options: CronWorkflowOptions = {}
 ): (
     phase: string,
@@ -113,10 +113,12 @@ export function withCronWorkflow(
         // Path to our loader
         const loaderPath = path.join(cronStartPath, "loader.cjs")
 
-        // Extend outputFileTracingRoot to include the package
-        const packageRoot = path.dirname(cronStartPath)
+        // Set outputFileTracingRoot if not already set.
+        // We use the Next.js project directory (process.cwd()) as the default,
+        // which works for both standalone apps and monorepos.
+        // In monorepos, users may need to override this to point to the monorepo root.
         if (!nextConfig.outputFileTracingRoot) {
-            nextConfig.outputFileTracingRoot = packageRoot
+            nextConfig.outputFileTracingRoot = process.cwd()
         }
 
         // Pre-generate cron wrappers BEFORE the SDK build
@@ -126,7 +128,7 @@ export function withCronWorkflow(
             phase !== "phase-production-server"
         ) {
             console.log("[workflow-cron-start] Pre-generating cron wrappers...")
-            
+
             try {
                 await pregenerateCronWrappers(process.cwd())
             } catch (error) {
@@ -180,14 +182,14 @@ export function withCronWorkflow(
             nextConfig.turbopack.rules[ext] = {
                 ...(supportsTurboCondition
                     ? {
-                          condition: {
-                              any: [
-                                  ...existingConditionAny,
-                                  { content: /cronStart/ },
-                                  { content: /(use workflow|use step)/ },
-                              ],
-                          },
-                      }
+                        condition: {
+                            any: [
+                                ...existingConditionAny,
+                                { content: /cronStart/ },
+                                { content: /(use workflow|use step)/ },
+                            ],
+                        },
+                    }
                     : {}),
                 loaders: [...existingLoaders, loaderPath],
             } as any

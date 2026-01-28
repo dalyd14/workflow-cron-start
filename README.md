@@ -37,6 +37,26 @@ const nextConfig: NextConfig = {
 export default withCronWorkflow(nextConfig)
 ```
 
+### Monorepo Setup (pnpm/yarn workspaces)
+
+The package automatically sets `outputFileTracingRoot` to the Next.js project directory, which works for most setups. If you have shared packages outside the Next.js app that need to be traced, you may need to override it to point to your monorepo root:
+
+```typescript
+// next.config.ts
+import { withCronWorkflow } from "workflow-cron-start/next"
+import path from "path"
+import { fileURLToPath } from "url"
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+const nextConfig = {
+  // Only needed if you have shared packages outside the Next.js app
+  outputFileTracingRoot: path.resolve(__dirname, "../.."),
+}
+
+export default withCronWorkflow(nextConfig)
+```
+
 ## Quick Start
 
 ### 1. Define your workflow
