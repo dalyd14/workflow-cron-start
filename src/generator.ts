@@ -271,7 +271,8 @@ async function ${triggerStepName}(
     const { ${workflowFunctionName} } = await import("${importPath}")
     
     // Start a NEW workflow run
-    const run = await start(${workflowFunctionName}, args)
+    // Type assertion needed because args are passed dynamically
+    const run = await start(${workflowFunctionName}, args as Parameters<typeof ${workflowFunctionName}>)
     
     console.log(\`[workflow-cron-start] Started ${workflowFunctionName} run: \${run.runId}\`)
     
