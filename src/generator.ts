@@ -1,24 +1,26 @@
 /**
  * Generator module for creating cron wrapper workflow files.
  * 
- * This module generates:
- * 1. A trigger route (route.ts) that calls start() on the actual workflow
- * 2. A cron scheduler workflow (workflow.ts) that uses a step to call the trigger
+ * This module generates cron scheduler workflows that:
+ * 1. Sleep until the next cron trigger time using cronSleep()
+ * 2. Call start() directly from a step to create a new workflow run
  * 
  * This architecture ensures each cron trigger creates a SEPARATE workflow run
  * with its own runId, enabling proper auditing and visibility.
+ * 
+ * The step calls start() directly (no HTTP request needed) because steps
+ * run in Node.js, not the workflow sandbox.
  */
 
 import { mkdir, writeFile, rm } from "node:fs/promises"
 import { join, dirname, relative, resolve } from "node:path"
 import { existsSync } from "node:fs"
 import type { CronStartCall } from "./scanner.js"
-import { 
-    readTsconfigPaths, 
-    resolvePathAlias, 
+import {
+    readTsconfigPaths,
     absolutePathToAlias,
     isPathAlias,
-    type TsconfigPaths 
+    type TsconfigPaths
 } from "./scanner.js"
 
 /** 
@@ -37,12 +39,12 @@ export function getCronWrapperDir(workingDir: string): string {
     if (existsSync(srcAppDir)) {
         return join(srcAppDir, CRON_WRAPPER_DIR_NAME)
     }
-    
+
     const appDir = join(workingDir, "app")
     if (existsSync(appDir)) {
         return join(appDir, CRON_WRAPPER_DIR_NAME)
     }
-    
+
     return join(srcAppDir, CRON_WRAPPER_DIR_NAME)
 }
 
@@ -52,7 +54,7 @@ export function getCronWrapperDir(workingDir: string): string {
 export interface GeneratorResult {
     /** Absolute paths to all generated workflow files */
     generatedFiles: string[]
-    
+
     /** Mapping of original workflow names to wrapper function names */
     wrapperMap: Map<string, string>
 }
@@ -72,10 +74,9 @@ interface WrapperInfo {
  * Creates a directory structure:
  * cron-wrappers/
  *   ├── trigger-myWorkflow/
- *   │   ├── route.ts      # Trigger endpoint
- *   │   └── workflow.ts   # Cron scheduler workflow
+ *   │   └── workflow.ts   # Cron scheduler workflow with step that calls start()
  *   ├── manifest.json
- *   └── route.ts          # Discovery route
+ *   └── route.ts          # Discovery route for SDK
  * 
  * @param calls - Array of CronStartCall objects from the scanner
  * @param workingDir - The working directory (project root)
@@ -86,27 +87,27 @@ export async function generateWrapperFiles(
     workingDir: string
 ): Promise<GeneratorResult> {
     const cronDir = getCronWrapperDir(workingDir)
-    
+
     // Read tsconfig paths for alias resolution
     const tsconfigPaths = await readTsconfigPaths(workingDir)
-    
+
     // Clean up previous generated files
     try {
         await rm(cronDir, { recursive: true, force: true })
     } catch {
         // Directory might not exist, that's fine
     }
-    
+
     // Create the directory
     await mkdir(cronDir, { recursive: true })
-    
+
     // Write gitignore to exclude generated files from version control
     await writeFile(join(cronDir, ".gitignore"), "*\n")
-    
+
     const generatedFiles: string[] = []
     const wrapperMap = new Map<string, string>()
     const wrapperInfos: WrapperInfo[] = []
-    
+
     // Group calls by workflow function name to avoid duplicates
     const uniqueWorkflows = new Map<string, CronStartCall>()
     for (const call of calls) {
@@ -115,7 +116,7 @@ export async function generateWrapperFiles(
             uniqueWorkflows.set(key, call)
         }
     }
-    
+
     // Generate wrapper directory for each unique workflow
     for (const [, call] of uniqueWorkflows) {
         const result = await generateWrapperDirectory(call, cronDir, workingDir, tsconfigPaths)
@@ -123,16 +124,16 @@ export async function generateWrapperFiles(
         wrapperMap.set(call.workflowFunctionName, result.wrapperName)
         wrapperInfos.push(result)
     }
-    
+
     // Generate manifest and discovery route
     await generateManifest(wrapperInfos, cronDir)
     await generateDiscoveryRoute(wrapperInfos, cronDir)
-    
+
     return { generatedFiles, wrapperMap }
 }
 
 /**
- * Generate a wrapper directory containing route.ts and workflow.ts
+ * Generate a wrapper directory containing workflow.ts
  */
 async function generateWrapperDirectory(
     call: CronStartCall,
@@ -141,42 +142,35 @@ async function generateWrapperDirectory(
     tsconfigPaths: TsconfigPaths
 ): Promise<WrapperInfo> {
     const { workflowFunctionName, importPath, sourceFile } = call
-    
+
     const wrapperName = `__cron__${workflowFunctionName}`
-    // Use a simpler directory name (no double underscores) for the route
+    // Use a simpler directory name (no double underscores)
     const triggerDirName = `trigger-${workflowFunctionName}`
     const wrapperDir = join(cronDir, triggerDirName)
-    
+
     // Create the wrapper subdirectory
     await mkdir(wrapperDir, { recursive: true })
-    
-    // Calculate import paths
-    const routeFilePath = join(wrapperDir, "route.ts")
+
+    // Calculate import path for the workflow file
     const workflowFilePath = join(wrapperDir, "workflow.ts")
-    
+
     const relativeImportPath = calculateRelativeImport(
-        routeFilePath,
+        workflowFilePath,
         importPath,
         sourceFile,
         workingDir,
         tsconfigPaths
     )
-    
-    // Generate trigger route (route.ts)
-    const routeContent = generateTriggerRouteContent(
-        workflowFunctionName,
-        relativeImportPath
-    )
-    await writeFile(routeFilePath, routeContent, "utf-8")
-    
+
     // Generate cron scheduler workflow (workflow.ts)
+    // The step inside will call start() directly on the target workflow
     const workflowContent = generateCronWorkflowContent(
         wrapperName,
         workflowFunctionName,
-        triggerDirName
+        relativeImportPath
     )
     await writeFile(workflowFilePath, workflowContent, "utf-8")
-    
+
     return { wrapperName, triggerDirName, workflowFilePath }
 }
 
@@ -198,24 +192,24 @@ function calculateRelativeImport(
     tsconfigPaths: TsconfigPaths
 ): string {
     const generatedDir = dirname(generatedFilePath)
-    
+
     // CASE 1: Original import is already an alias - preserve it as-is
     // This avoids converting @/lib/workflow to ../../../lib/workflow
     if (isPathAlias(originalImportPath, tsconfigPaths)) {
         return originalImportPath
     }
-    
+
     // CASE 2: Relative import - try to convert to an alias first
     if (originalImportPath.startsWith(".")) {
         const sourceDir = dirname(sourceFile)
         const absoluteTarget = resolve(sourceDir, originalImportPath)
-        
+
         // Try to convert the absolute path to an alias
         const aliasImport = absolutePathToAlias(absoluteTarget, workingDir, tsconfigPaths)
         if (aliasImport) {
             return aliasImport
         }
-        
+
         // Fall back to calculating relative path from generated file
         let relativePath = relative(generatedDir, absoluteTarget).replace(/\\/g, "/")
         if (!relativePath.startsWith(".")) {
@@ -223,100 +217,35 @@ function calculateRelativeImport(
         }
         return relativePath
     }
-    
+
     // CASE 3: Other imports (bare package names, etc.) - return as-is
     return originalImportPath
 }
 
 /**
- * Generate the trigger route content (route.ts).
- * This endpoint receives HTTP requests and calls start() on the actual workflow.
- */
-function generateTriggerRouteContent(
-    workflowFunctionName: string,
-    importPath: string
-): string {
-    return `/**
- * Auto-generated trigger route for ${workflowFunctionName}
- * DO NOT EDIT - This file is generated by workflow-cron-start
- * 
- * This endpoint is called by the cron scheduler workflow to start
- * a new run of the actual workflow. Each call creates a separate
- * workflow run with its own runId.
- */
-
-import { start } from "workflow/api"
-import { ${workflowFunctionName} } from "${importPath}"
-
-const CRON_TRIGGER_HEADER = "x-workflow-cron-trigger"
-const CRON_TRIGGER_SECRET = "workflow-cron-start-internal"
-
-export async function POST(request: Request) {
-    // Validate the request is from our cron scheduler
-    const triggerHeader = request.headers.get(CRON_TRIGGER_HEADER)
-    if (triggerHeader !== CRON_TRIGGER_SECRET) {
-        return Response.json(
-            { error: "Unauthorized" },
-            { status: 401 }
-        )
-    }
-    
-    try {
-        const { args } = await request.json()
-        
-        // Start a NEW workflow run
-        const run = await start(${workflowFunctionName}, args)
-        
-        console.log(\`[workflow-cron-start] Started ${workflowFunctionName} run: \${run.runId}\`)
-        
-        return Response.json({
-            runId: run.runId,
-            status: "started",
-            workflow: "${workflowFunctionName}"
-        })
-    } catch (error) {
-        console.error("[workflow-cron-start] Failed to start workflow:", error)
-        return Response.json(
-            { error: String(error) },
-            { status: 500 }
-        )
-    }
-}
-
-// Return 405 for other methods
-export async function GET() {
-    return Response.json({ error: "Method not allowed" }, { status: 405 })
-}
-`
-}
-
-/**
  * Generate the cron scheduler workflow content (workflow.ts).
- * This workflow sleeps until the next cron trigger, then calls the trigger endpoint.
+ * This workflow sleeps until the next cron trigger, then calls start() directly.
  */
 function generateCronWorkflowContent(
     wrapperName: string,
     workflowFunctionName: string,
-    triggerDirName: string
+    importPath: string
 ): string {
     const triggerStepName = `__trigger_${workflowFunctionName}__`
-    
+
     return `/**
  * Auto-generated cron scheduler for ${workflowFunctionName}
  * DO NOT EDIT - This file is generated by workflow-cron-start
  * 
  * This workflow runs in an infinite loop:
  * 1. Sleep until the next cron trigger time
- * 2. Call the trigger endpoint to start a new workflow run
+ * 2. Call start() directly from a step to create a new workflow run
  * 3. Repeat
  * 
  * Each trigger creates a SEPARATE workflow run with its own runId.
  */
 
 import { cronSleep } from "workflow-cron-sleep"
-
-const CRON_TRIGGER_HEADER = "x-workflow-cron-trigger"
-const CRON_TRIGGER_SECRET = "workflow-cron-start-internal"
 
 /**
  * Cron configuration passed to the scheduler workflow
@@ -329,30 +258,24 @@ interface CronSchedulerConfig {
 }
 
 /**
- * Step that triggers a new workflow run via HTTP.
- * Steps run in Node.js, so they can make external HTTP requests.
+ * Step that starts a new workflow run directly.
+ * Steps run in Node.js (not the workflow sandbox), so they can call start().
  */
 async function ${triggerStepName}(
-    triggerUrl: string,
     args: unknown[]
-): Promise<{ runId: string; status: string }> {
+): Promise<{ runId: string }> {
     "use step"
     
-    const response = await fetch(triggerUrl, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            [CRON_TRIGGER_HEADER]: CRON_TRIGGER_SECRET
-        },
-        body: JSON.stringify({ args })
-    })
+    // Dynamic imports inside step to avoid sandbox restrictions
+    const { start } = await import("workflow/api")
+    const { ${workflowFunctionName} } = await import("${importPath}")
     
-    if (!response.ok) {
-        const errorText = await response.text()
-        throw new Error(\`Trigger failed (\${response.status}): \${errorText}\`)
-    }
+    // Start a NEW workflow run
+    const run = await start(${workflowFunctionName}, args)
     
-    return response.json()
+    console.log(\`[workflow-cron-start] Started ${workflowFunctionName} run: \${run.runId}\`)
+    
+    return { runId: run.runId }
 }
 
 /**
@@ -366,23 +289,16 @@ export async function ${wrapperName}(config: CronSchedulerConfig) {
     
     const { args, cron, timezone, onError = "continue" } = config
     
-    // Construct the trigger URL
-    const baseUrl = process.env.VERCEL_URL
-        ? \`https://\${process.env.VERCEL_URL}\`
-        : \`http://localhost:\${process.env.PORT || 3000}\`
-    const triggerUrl = \`\${baseUrl}/cron-wrappers/${triggerDirName}\`
-    
     console.log(\`[workflow-cron-start] Cron scheduler started for ${workflowFunctionName}\`)
     console.log(\`[workflow-cron-start] Schedule: \${cron}, Timezone: \${timezone || "UTC"}\`)
-    console.log(\`[workflow-cron-start] Trigger URL: \${triggerUrl}\`)
     
     while (true) {
         // Sleep until the next cron trigger
         await cronSleep(cron, { timezone })
         
         try {
-            // Trigger a new workflow run
-            const result = await ${triggerStepName}(triggerUrl, args)
+            // Start a new workflow run directly from the step
+            const result = await ${triggerStepName}(args)
             console.log(\`[workflow-cron-start] Triggered ${workflowFunctionName}: \${result.runId}\`)
         } catch (error) {
             if (onError === "stop") {
@@ -403,18 +319,17 @@ async function generateManifest(
     wrapperInfos: WrapperInfo[],
     cronDir: string
 ): Promise<void> {
-    const manifest: Record<string, { wrapperName: string; triggerPath: string; triggerDir: string }> = {}
-    
+    const manifest: Record<string, { wrapperName: string; triggerDir: string }> = {}
+
     for (const info of wrapperInfos) {
         // Extract the original workflow name from the wrapper name
         const workflowName = info.wrapperName.replace(/^__cron__/, '')
         manifest[workflowName] = {
             wrapperName: info.wrapperName,
-            triggerDir: info.triggerDirName,
-            triggerPath: `/cron-wrappers/${info.triggerDirName}`
+            triggerDir: info.triggerDirName
         }
     }
-    
+
     const manifestPath = join(cronDir, "manifest.json")
     await writeFile(manifestPath, JSON.stringify(manifest, null, 2), "utf-8")
 }
@@ -429,12 +344,12 @@ async function generateDiscoveryRoute(
 ): Promise<void> {
     const imports: string[] = []
     const exports: string[] = []
-    
+
     for (const info of wrapperInfos) {
         imports.push(`import { ${info.wrapperName} } from "./${info.triggerDirName}/workflow"`)
         exports.push(info.wrapperName)
     }
-    
+
     const routeContent = `/**
  * Auto-generated discovery route for workflow-cron-start
  * DO NOT EDIT - This file is generated by workflow-cron-start
@@ -456,7 +371,7 @@ export async function GET() {
     })
 }
 `
-    
+
     const routePath = join(cronDir, "route.ts")
     await writeFile(routePath, routeContent, "utf-8")
 }
@@ -473,10 +388,10 @@ export function getManifestPath(workingDir: string): string {
  */
 export async function loadManifest(
     workingDir: string
-): Promise<Record<string, { wrapperName: string; triggerPath: string; triggerDir: string }> | null> {
+): Promise<Record<string, { wrapperName: string; triggerDir: string }> | null> {
     const { readFile } = await import("node:fs/promises")
     const manifestPath = getManifestPath(workingDir)
-    
+
     try {
         const content = await readFile(manifestPath, "utf-8")
         return JSON.parse(content)
